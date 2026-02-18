@@ -1,0 +1,56 @@
+================================================================================
+PostgreSQL 14 Logical Replication on RHEL 9 - Quick Reference
+================================================================================
+
+PUBLISHER (Source)
+------------------
+1. postgresql.conf:
+   wal_level = logical
+   max_replication_slots = 10
+   max_wal_senders = 10
+   --> systemctl restart postgresql-14
+
+2. pg_hba.conf: allow subscriber IP for replication user
+   host  all  logical_repl  <subscriber_ip>/32  scram-sha-256
+   --> systemctl reload postgresql-14
+
+3. Create user (optional):
+   CREATE USER logical_repl WITH REPLICATION PASSWORD 'xxx';
+   GRANT USAGE ON SCHEMA public TO logical_repl;
+   GRANT SELECT ON ALL TABLES IN SCHEMA public TO logical_repl;
+
+4. Create publication:
+   CREATE PUBLICATION mypub FOR TABLE t1, t2;
+   -- or: FOR ALL TABLES IN SCHEMA public;
+
+
+SUBSCRIBER (Target)
+-------------------
+1. Create same database and table structure (schema) as publisher.
+   (pg_dump -s from publisher, restore on subscriber.)
+
+2. Create subscription:
+   CREATE SUBSCRIPTION mysub
+   CONNECTION 'host=<publisher_ip> port=5432 dbname=myapp user=logical_repl password=xxx'
+   PUBLICATION mypub;
+
+
+VERIFY
+------
+Publisher:
+  SELECT * FROM pg_replication_slots;
+  \dRp+
+
+Subscriber:
+  SELECT * FROM pg_stat_subscription;
+  \dRs+
+
+
+RHEL 9 PATHS / COMMANDS
+------------------------
+Data:    /var/lib/pgsql/14/data
+Config:  postgresql.conf, pg_hba.conf (inside data)
+Service: systemctl status|start|restart|reload postgresql-14
+Logs:    journalctl -u postgresql-14 -f
+
+================================================================================

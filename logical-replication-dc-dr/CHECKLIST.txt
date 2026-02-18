@@ -1,0 +1,37 @@
+================================================================================
+PostgreSQL 14 Logical Replication - Implementation Checklist (RHEL 9)
+================================================================================
+
+BEFORE YOU START
+[ ] RHEL 9 and PostgreSQL 14 installed on both publisher and subscriber
+[ ] Network connectivity and firewall (port 5432) allowed between both hosts
+[ ] Decide replication user name and secure password
+
+PUBLISHER
+[ ] Edit postgresql.conf: wal_level = logical, max_replication_slots, max_wal_senders
+[ ] Restart PostgreSQL: sudo systemctl restart postgresql-14
+[ ] Verify: SHOW wal_level;  --> logical
+[ ] Add pg_hba.conf entry for subscriber IP and replication user
+[ ] Reload: sudo systemctl reload postgresql-14
+[ ] Create replication user (optional): CREATE USER ... REPLICATION; GRANT SELECT ...
+[ ] Create database and tables (or use existing)
+[ ] Create publication: CREATE PUBLICATION ... FOR TABLE ... / FOR ALL TABLES ...
+
+SUBSCRIBER
+[ ] Create same database name
+[ ] Create same table structure (same columns and primary key); use pg_dump -s if needed
+[ ] Create subscription: CREATE SUBSCRIPTION ... CONNECTION '...' PUBLICATION ...;
+[ ] Wait for initial sync if copy_data = true (default)
+
+VERIFICATION
+[ ] On publisher: pg_replication_slots shows slot for subscription, active = t
+[ ] On subscriber: pg_stat_subscription shows worker and no errors
+[ ] Compare row counts on publisher and subscriber for published tables
+[ ] Insert/update/delete on publisher and confirm change appears on subscriber
+
+ONGOING
+[ ] Monitor pg_replication_slots and pg_stat_subscription
+[ ] Check logs: journalctl -u postgresql-14
+[ ] Plan for adding/removing tables (ALTER PUBLICATION / REFRESH PUBLICATION)
+
+================================================================================
