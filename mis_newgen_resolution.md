@@ -12,7 +12,7 @@
 
 - Keep the production primary **write‑optimized** (no new heavy indexes).
 - Keep the existing secondary as a **HA standby** (unchanged, read‑only).
-- Use the empty server as a **logical reporting replica**, where we:
+- Use the empty server as a **reporting replica** (data can be loaded via **logical replication** and/or **pg_basebackup**; see Section 5 for options), where we:
   - Add the required reporting indexes on the 3–4 base tables.
   - Create a materialized view `mis_newgen_mv` to replace `mis_newgen` for reporting.
   - Run all heavy `mis_newgen` queries without impacting the primary.
@@ -75,9 +75,61 @@ These actions reduce immediate risk while we put the dedicated reporting archite
 
 ---
 
-### 5. Implementation Plan (High Level)
+### 5. Reporting Server Setup: Options (Including pg_basebackup)
 
-#### 5.1. Primary – Enable Logical Replication
+You can build the reporting server in three ways. Choose based on whether you prefer **logical replication only**, **pg_basebackup only** (periodic refresh), or **pg_basebackup to seed** then **logical replication** for ongoing sync.
+
+| Option | How reporting server gets data | Freshness | Use when |
+|--------|--------------------------------|-----------|----------|
+| **A**  | Logical replication only (subscription with `copy_data = true`) | Near real-time | You want continuous sync and can wait for initial copy. |
+| **B**  | pg_basebackup only (restore as standalone, no replication) | As of last backup (e.g. nightly) | You are okay with periodic refresh (e.g. daily) and can run backup/restore + index creation on a schedule. |
+| **C**  | pg_basebackup to seed, then logical replication for ongoing changes | Near real-time after initial seed | Database is very large; you want a fast initial load, then continuous sync. |
+
+#### Option A: Logical Replication Only (Default in this document)
+
+- Primary has `wal_level = logical` and a **publication** for the `mis_newgen` base tables.
+- On the **empty server** (normal instance, not standby): create same schemas/tables, then **CREATE SUBSCRIPTION** with `copy_data = true`.
+- Initial copy and ongoing changes are both via logical replication. No pg_basebackup.
+- **Pros:** Single mechanism, continuous sync, no file-level restore.  
+- **Cons:** Initial copy can be slow for very large DBs.
+
+#### Option B: pg_basebackup Only (Periodic Full Refresh)
+
+- Use **pg_basebackup** to take a full backup from the primary.
+- Restore that backup on the empty server and **start as a normal instance** (do **not** start as standby — no `standby.signal`, no `primary_conninfo` in recovery). So the server is standalone and read-write.
+- On this copy: create the 3–4 reporting indexes and, if needed, the materialized view. Run all heavy `mis_newgen` queries here.
+- Data is **as of the backup time**. To refresh:
+  - Take a new pg_basebackup (e.g. nightly).
+  - Stop the reporting instance, replace its data directory with the new backup (or restore to a new directory and swap).
+  - Start the instance and **re-create the reporting indexes** (and MV) after each restore, because the restored data is a copy of the primary, which has no reporting indexes.
+- **Pros:** Uses only tools you may already use (pg_basebackup); no logical replication setup.  
+- **Cons:** Data is not real-time; you need a repeatable process (script) for restore + index creation; reporting is down or on stale data during refresh unless you use two alternating copies.
+
+#### Option C: pg_basebackup to Seed, Then Logical Replication (Hybrid)
+
+- **Step 1 – Seed with pg_basebackup**
+  - Take **pg_basebackup** from the primary to the empty server.
+  - Restore and **start as a streaming standby** (with `primary_conninfo`) so it replays WAL and catches up to “now”.
+  - **Promote** the standby (`pg_ctl promote` or equivalent). It is now a standalone, read-write instance with a full copy of the primary as of promote time.
+- **Step 2 – Reporting objects**
+  - On this promoted instance: create the 3–4 reporting indexes and the materialized view. Do **not** add these on the primary.
+- **Step 3 – Ongoing sync via logical replication**
+  - On primary: ensure `wal_level = logical` and create a **publication** for the same base tables.
+  - On the reporting server: **CREATE SUBSCRIPTION** to that publication with **`copy_data = false`** (tables already exist and are in sync from the physical copy).
+  - From then on, the reporting server receives only incremental changes from the primary and stays near real-time.
+- **Pros:** Fast initial load (physical copy); then continuous sync without full re-restore.  
+- **Cons:** More steps; requires one-time promotion and correct subscription setup with `copy_data = false`.
+
+**Recommendation:**  
+- Prefer **Option A** if the initial logical copy time is acceptable.  
+- Use **Option B** if you explicitly want only pg_basebackup and can accept periodic refresh (e.g. nightly) and a refresh + index-creation procedure.  
+- Use **Option C** if the database is very large and you want both a fast initial seed (pg_basebackup) and ongoing sync (logical replication).
+
+---
+
+### 6. Implementation Plan (High Level)
+
+#### 6.1. Primary – Enable Logical Replication
 
 1. **Configure WAL level and slots** (if not already set)
    - `wal_level = logical`
@@ -107,7 +159,7 @@ CREATE PUBLICATION mis_pub FOR TABLE
   mis.table4;  -- the 3–4 key tables
 ```
 
-#### 5.2. Empty Server – Set Up Logical Reporting Replica
+#### 6.2. Empty Server – Set Up Logical Reporting Replica
 
 5. **Initialize as normal PostgreSQL instance**
    - Do **not** configure as standby; ensure `pg_is_in_recovery() = false`.
@@ -140,9 +192,9 @@ SELECT * FROM pg_stat_subscription;
 
 ---
 
-### 6. Reporting‑Side Indexing and Materialized View
+### 7. Reporting‑Side Indexing and Materialized View
 
-#### 6.1. Add Indexes Only on Reporting Server
+#### 7.1. Add Indexes Only on Reporting Server
 
 10. **Create the required indexes on the 3–4 tables on the reporting replica only**, for example:
 
@@ -154,7 +206,7 @@ CREATE INDEX CONCURRENTLY idx_table2_colB ON mis.table2 (colB);
 
 - These indexes are **not** created on the primary, so primary write performance is preserved.
 
-#### 6.2. Materialized View to Replace `mis_newgen`
+#### 7.2. Materialized View to Replace `mis_newgen`
 
 11. **Create materialized view on reporting replica**
 
@@ -183,7 +235,7 @@ FROM mis.mis_newgen_mv
 WHERE <appropriate filters>;
 ```
 
-#### 6.3. Safe Refresh Strategy
+#### 7.3. Safe Refresh Strategy
 
 14. **Refresh during off‑peak windows** (on reporting server)
 
@@ -195,7 +247,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY mis.mis_newgen_mv;
 
 ---
 
-### 7. Benefits of This Solution
+### 8. Benefits of This Solution
 
 - **No impact on primary write performance:**
   - No additional heavy indexes on primary tables.
@@ -214,7 +266,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY mis.mis_newgen_mv;
 
 ---
 
-### 8. Summary
+### 9. Summary
 
 - The current secondary cannot host indexes because it is a **read‑only hot standby**.
 - To index `mis_newgen`’s base tables without slowing down writes, we will:
